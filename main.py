@@ -16,12 +16,12 @@ import inspect
 from functools import wraps
 
 # Настройка логгера
-logger.add("bot.log", rotation="1 MB")
+logger.add("bot.log", rotation="1 MB", encoding="utf-8")
 logger.info("🚀 Бот запускается")
 
 # Получение токенов
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-VK_TOKEN = os.getenv("VK_API_TOKEN")
+BOT_TOKEN = "7735071651:AAHVN_ZjYJ2NZRIzJXtvDfRIPUcZhPBqUEo"
+VK_TOKEN = "4ccacfc94ccacfc94ccacfc9024fffb48c44cca4ccacfc924a94e533627dc4bbeb3ee97"
 
 if not BOT_TOKEN or not VK_TOKEN:
     logger.error("Токены не установлены")
@@ -186,10 +186,9 @@ def handle_error(handler):
 async def cmd_start(message: types.Message, state: FSMContext):
     logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
     await state.clear()
-    await message.answer(
-        "✨ Добро пожаловать!\nВы можете:\n🔗 Сокращать ссылки\n📊 Смотреть статистику\n📋 Хранить ссылки",
-        reply_markup=get_main_menu()
-    )
+    start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сокращать ссылки\n📊 Смотреть статистику\n📋 Хранить ссылки"
+    logger.info(f"Отправляем стартовое сообщение: {start_message}")
+    await message.answer(start_message, reply_markup=get_main_menu())
 
 @router.message(Command("links"))
 @handle_error
@@ -320,7 +319,7 @@ async def process_stats_date(message: types.Message, state: FSMContext):
         await state.clear()
         return
     loading_msg = await message.answer('⏳ Загружаем...')
-    semaphore = asyncio.Semaphore(5)  # Ограничение на 5 одновременных запросов
+    semaphore = asyncio.Semaphore(5)
     async def limited_get_stats(link, date_from, date_to, semaphore):
         async with semaphore:
             return await get_link_stats(link['short'].split('/')[-1], date_from, date_to)
@@ -381,4 +380,6 @@ async def main():
             await bot.session.close()
 
 if __name__ == "__main__":
+    import sys
+    logger.info(f"Кодировка stdout: {sys.stdout.encoding}")
     asyncio.run(main())
