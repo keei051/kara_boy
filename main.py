@@ -138,7 +138,7 @@ def handle_error(handler):
     async def wrapper(*args, **kwargs):
         try:
             # Убираем лишние kwargs, такие как dispatcher
-            return await handler(*args)
+          return await handler(*args, **kwargs)
         except Exception as e:
             logger.error(f"Ошибка в {handler.__name__}: {e}")
             text = f"❌ Ошибка: {str(e)[:50]}"
