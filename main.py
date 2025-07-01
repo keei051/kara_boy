@@ -3,7 +3,7 @@ import asyncio
 import json
 import re
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 from loguru import logger
 import aiohttp
 from aiogram import Bot, Dispatcher, types, Router
@@ -12,14 +12,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import inspect
+from functools import wraps
 
 # Настройка логгера
 logger.add("bot.log", rotation="1 MB")
 logger.info("🚀 Бот запускается")
 
 # Получение токенов
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "7735071651:AAHVN_ZjYJ2NZRIzJXtvDfRIPUcZhPBqUEo"
-VK_TOKEN = os.getenv("VK_API_TOKEN") or "4ccacfc94ccacfc94ccacfc9024fffb48c44cca4ccacfc924a94e533627dc4bbeb3ee97"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+VK_TOKEN = os.getenv("VK_API_TOKEN")
 
 if not BOT_TOKEN or not VK_TOKEN:
     logger.error("Токены не установлены")
@@ -71,32 +73,58 @@ class JsonStorage:
 
 storage = JsonStorage()
 
+# Очистка URL для безопасного логирования
+def sanitize_url(url):
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    sensitive_params = ['token', 'password', 'key']
+    for param in sensitive_params:
+        if param in query_params:
+            query_params[param] = ['[REDACTED]']
+    query = "&".join(f"{k}={v[0]}" for k, v in query_params.items()) if query_params else ""
+    return parsed._replace(query=query).geturl()
+
 # Проверка валидности URL
 async def is_valid_url(url):
+    sanitized_url = sanitize_url(url)
     if not re.match(r'^https?://[^\s]+$', url):
+        logger.error(f"Недействительный URL: {sanitized_url}")
         return False
     try:
         async with aiohttp.ClientSession() as session:
             async with session.head(url, timeout=5) as r:
-                return r.status in (200, 301, 302)
-    except Exception as e:
-        logger.error(f"Ошибка проверки URL {url}: {e}")
+                if r.status in (200, 301, 302):
+                    return True
+                elif r.status == 429:
+                    logger.warning(f"Слишком много запросов для {sanitized_url}")
+                    return False
+                return False
+    except aiohttp.ClientError as e:
+        logger.error(f"Ошибка проверки URL {sanitized_url}: {e}")
+        return False
+    except asyncio.TimeoutError:
+        logger.error(f"Таймаут при проверке URL {sanitized_url}")
         return False
 
 # Функция сокращения ссылки через VK API
 async def shorten_link_vk(url):
+    sanitized_url = sanitize_url(url)
     if not await is_valid_url(url):
         return None, "Недействительный или недоступный URL"
     encoded_url = quote(url, safe='')
+    if len(encoded_url) > 8000:
+        logger.error(f"URL слишком длинный: {sanitized_url}")
+        return None, "URL слишком длинный для сокращения"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(f"https://api.vk.com/method/utils.getShortLink?url={encoded_url}&v=5.199&access_token={VK_TOKEN}") as resp:
                 data = await resp.json()
                 if 'response' in data and 'short_url' in data['response']:
                     return data['response']['short_url'], ""
+                logger.error(f"Ошибка VK API для {sanitized_url}: {data.get('error', 'Неизвестная ошибка')}")
                 return None, "Ошибка VK API"
     except Exception as e:
-        logger.error(f"Ошибка при сокращении ссылки: {e}")
+        logger.error(f"Ошибка при сокращении ссылки {sanitized_url}: {e}")
         return None, "Не удалось сократить ссылку"
 
 # Функция получения статистики по ссылке
@@ -115,7 +143,7 @@ async def get_link_stats(key, date_from=None, date_to=None):
                         total += day.get("views", 0)
                 return {"views": total}
     except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
+        logger.error(f"Ошибка получения статистики для ключа {key}: {e}")
         return {"views": 0}
 
 # Создание клавиатуры
@@ -135,10 +163,12 @@ cancel_kb = make_kb([InlineKeyboardButton(text="🚫 Отмена", callback_dat
 
 # Декоратор обработки ошибок
 def handle_error(handler):
+    @wraps(handler)
     async def wrapper(*args, **kwargs):
         try:
-            # Убираем лишние kwargs, такие как dispatcher
-          return await handler(*args, **kwargs)
+            sig = inspect.signature(handler)
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return await handler(*args, **filtered_kwargs)
         except Exception as e:
             logger.error(f"Ошибка в {handler.__name__}: {e}")
             text = f"❌ Ошибка: {str(e)[:50]}"
@@ -173,8 +203,26 @@ async def cmd_links(message: types.Message, state: FSMContext):
         return
     text = "📋 Ваши ссылки:\n\n"
     for link in links:
-        text += f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
+        link_text = f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
+        if len(text) + len(link_text) > 4000:
+            await message.answer(text, reply_markup=get_main_menu())
+            text = "📋 Ваши ссылки (продолжение):\n\n"
+        text += link_text
     await message.answer(text, reply_markup=get_main_menu())
+
+@router.message(Command("help"))
+@handle_error
+async def cmd_help(message: types.Message, state: FSMContext):
+    logger.info(f"Получена команда /help от пользователя {message.from_user.id}")
+    await state.clear()
+    await message.answer(
+        "ℹ️ Помощь по боту:\n\n"
+        "/start — начать работу\n"
+        "/links — показать сохранённые ссылки\n"
+        "/help — показать эту справку\n"
+        "🔗 Используйте кнопки для сокращения ссылок, просмотра статистики и управления ссылками",
+        reply_markup=get_main_menu()
+    )
 
 @router.callback_query(lambda c: c.data == "cancel")
 @handle_error
@@ -254,13 +302,16 @@ async def process_stats_date(message: types.Message, state: FSMContext):
         return
     date_from, date_to = dates
     try:
-        datetime.strptime(date_from, "%Y-%m-%d")
-        datetime.strptime(date_to, "%Y-%m-%d")
+        date_from_dt = datetime.strptime(date_from, "%Y-%m-%d")
+        date_to_dt = datetime.strptime(date_to, "%Y-%m-%d")
+        if date_from_dt > datetime.now():
+            await message.answer("❌ Начальная дата не может быть в будущем", reply_markup=cancel_kb)
+            return
+        if date_to_dt < date_from_dt:
+            await message.answer("❌ Конечная дата не может быть раньше начальной", reply_markup=cancel_kb)
+            return
     except ValueError:
-        await message.answer("❌ Неверные даты. Используйте формат ГГГГ-ММ-ДД", reply_markup=cancel_kb)
-        return
-    if datetime.strptime(date_to, "%Y-%m-%d") < datetime.strptime(date_from, "%Y-%m-%d"):
-        await message.answer("❌ Конечная дата не может быть раньше начальной", reply_markup=cancel_kb)
+        await message.answer("❌ Неверные даты. Используйте формат ГГГГ-ММ-ДД и реальные даты", reply_markup=cancel_kb)
         return
     uid = str(message.from_user.id)
     links = storage.get_user_links(uid)
@@ -269,8 +320,12 @@ async def process_stats_date(message: types.Message, state: FSMContext):
         await state.clear()
         return
     loading_msg = await message.answer('⏳ Загружаем...')
+    semaphore = asyncio.Semaphore(5)  # Ограничение на 5 одновременных запросов
+    async def limited_get_stats(link, date_from, date_to, semaphore):
+        async with semaphore:
+            return await get_link_stats(link['short'].split('/')[-1], date_from, date_to)
     stats = await asyncio.gather(
-        *(get_link_stats(link['short'].split('/')[-1], date_from, date_to) for link in links)
+        *(limited_get_stats(link, date_from, date_to, semaphore) for link in links)
     )
     text = f"📊 Статистика переходов за {date_from}—{date_to}\n\n"
     total_views = 0
@@ -295,35 +350,35 @@ async def list_links(cb: types.CallbackQuery, state: FSMContext):
         return
     text = "📋 Ваши ссылки:\n\n"
     for link in links:
-        text += f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
+        link_text = f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
+        if len(text) + len(link_text) > 4000:
+            await cb.message.answer(text, reply_markup=get_main_menu())
+            text = "📋 Ваши ссылки (продолжение):\n\n"
+        text += link_text
     await cb.message.edit_text(text, reply_markup=get_main_menu())
     await cb.answer()
 
 async def main():
     logger.info("Запуск бота...")
-    try:
-        # Повторные попытки удаления webhook для устранения конфликтов
-        for attempt in range(5):
-            try:
-                await bot.delete_webhook(drop_pending_updates=True)
-                logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
-                break
-            except Exception as e:
-                logger.warning(f"Ошибка удаления webhook с попытки {attempt + 1}: {e}")
-                if attempt < 4:
-                    await asyncio.sleep(3)
-                else:
-                    logger.error("Не удалось удалить webhook после 5 попыток")
-                    raise
-        dp.include_router(router)  # Подключаем роутер только здесь
-        logger.info("Начинаем polling")
-        await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
-    except Exception as e:
-        logger.error(f"Ошибка бота: {e}")
-        raise
-    finally:
-        logger.info("Закрытие сессии бота")
-        await bot.session.close()
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
+            dp.include_router(router)
+            logger.info("Начинаем polling")
+            await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
+            break
+        except Exception as e:
+            logger.error(f"Ошибка бота (попытка {attempt + 1}/{max_attempts}): {e}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(5)
+            else:
+                logger.error("Превышено количество попыток")
+                raise
+        finally:
+            logger.info("Закрытие сессии бота")
+            await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
