@@ -18,7 +18,7 @@ import threading
 
 # Настройка логгера
 logger.add("bot.log", rotation="1 MB", encoding="utf-8")
-logger.info("🚀 Бот запускается в 06:19 PM CEST, 01 июля 2025")
+logger.info("🚀 Бот запускается в 06:22 PM CEST, 01 июля 2025")
 
 # Получение токенов
 BOT_TOKEN = "7735071651:AAHVN_ZjYJ2NZRIzJXtvDfRIPUcZhPBqUEo"
@@ -402,6 +402,25 @@ async def process_rename(message: types.Message, state: FSMContext):
     await state.clear()
 
 # Запуск
+async def main():
+    logger.info("Запуск бота...")
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
+            dp.include_router(router)
+            logger.info("Начинаем polling")
+            await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
+            break
+        except Exception as e:
+            logger.error(f"Ошибка бота (попытка {attempt + 1}/{max_attempts}): {str(type(e).__name__)} - {str(e)[:100]}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(5)
+            else:
+                logger.error("Превышено количество попыток")
+                raise
+
 if __name__ == "__main__":
     import sys
     logger.info(f"Кодировка stdout: {sys.stdout.encoding}")
