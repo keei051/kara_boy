@@ -137,7 +137,8 @@ cancel_kb = make_kb([InlineKeyboardButton(text="🚫 Отмена", callback_dat
 def handle_error(handler):
     async def wrapper(*args, **kwargs):
         try:
-            return await handler(*args, **kwargs)
+            # Убираем лишние kwargs, такие как dispatcher
+            return await handler(*args)
         except Exception as e:
             logger.error(f"Ошибка в {handler.__name__}: {e}")
             text = f"❌ Ошибка: {str(e)[:50]}"
