@@ -308,7 +308,7 @@ async def main():
                 logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
                 break
             except Exception as e:
-                logger.warning(f"Ошибка удаления webhook the попытки {attempt + 1}: {e}")
+                logger.warning(f"Ошибка удаления webhook с попытки {attempt + 1}: {e}")
                 if attempt < 4:
                     await asyncio.sleep(3)
                 else:
