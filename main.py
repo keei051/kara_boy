@@ -18,7 +18,7 @@ import threading
 
 # Настройка логгера
 logger.add("bot.log", rotation="1 MB", encoding="utf-8")
-logger.info("🚀 Бот запускается в 06:22 PM CEST, 01 июля 2025")
+logger.info("🚀 Бот запускается в 06:28 PM CEST, 01 июля 2025")
 
 # Получение токенов
 BOT_TOKEN = "7735071651:AAHVN_ZjYJ2NZRIzJXtvDfRIPUcZhPBqUEo"
@@ -252,7 +252,7 @@ async def cancel_action(cb: types.CallbackQuery, state: FSMContext):
 async def add_link(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text(
-        "🔗 Введите ссылку (http://... или https://...):",
+        "🔗 Введите ссылку (http:// или https://):",
         reply_markup=cancel_kb
     )
     await state.set_state(LinkForm.waiting_for_link)
@@ -263,7 +263,7 @@ async def add_link(cb: types.CallbackQuery, state: FSMContext):
 async def process_link(message: types.Message, state: FSMContext):
     url = message.text.strip()
     if not await is_valid_url(url):
-        await message.answer("❌ Неверный или недоступный URL. Попробуйте снова (пример: https://example.com):", reply_markup=cancel_kb)
+        await message.answer("❌ Неверный URL. Убедитесь, что он начинается с http:// или https:// и доступен. Пример: https://example.com", reply_markup=cancel_kb)
         return
     loading_msg = await message.answer('⏳ Сокращаю...')
     short_url, key, error_msg = await shorten_link_vk(url)
