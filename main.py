@@ -14,10 +14,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import inspect
 from functools import wraps
+import threading
 
 # Настройка логгера
 logger.add("bot.log", rotation="1 MB", encoding="utf-8")
-logger.info("🚀 Бот запускается")
+logger.info("🚀 Бот запускается в 05:50 PM CEST, 01 июля 2025")
 
 # Получение токенов
 BOT_TOKEN = "7735071651:AAHVN_ZjYJ2NZRIzJXtvDfRIPUcZhPBqUEo"
@@ -27,415 +28,398 @@ if not BOT_TOKEN or not VK_TOKEN:
     logger.error("Токены не установлены")
     raise ValueError("BOT_TOKEN и VK_TOKEN должны быть установлены")
 
+# Блокировка для JSON
+json_lock = threading.Lock()
+
 # Инициализация бота
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-
-# Класс состояний
-class LinkForm(StatesGroup):
-    waiting_for_link = State()
-    waiting_for_title = State()
-    waiting_for_stats_date = State()
-    waiting_for_link_action = State()
-
-# Класс для работы с JSON
-class JsonStorage:
-    def __init__(self, file_name="links.json"):
-        self.file_name = file_name
-        self.data = self._load_data()
-
-    def _load_data(self):
-        try:
-            with open(self.file_name, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            logger.info("Файл links.json не найден, создаётся новый")
-            return {}
-
-    def _save_data(self):
-        try:
-            with open(self.file_name, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка записи JSON: {e}")
-            raise
-
-    def get_user_links(self, user_id):
-        return self.data.get(str(user_id), [])
-
-    def add_link(self, user_id, link_data):
-        uid = str(user_id)
-        self.data.setdefault(uid, [])
-        if len(self.data[uid]) >= 50:
-            self.data[uid].pop(0)
-        self.data[uid].append(link_data)
-        self._save_data()
-
-    def delete_link(self, user_id, link_index):
-        uid = str(user_id)
-        if uid in self.data and 0 <= link_index < len(self.data[uid]):
-            self.data[uid].pop(link_index)
-            self._save_data()
-            return True
-        return False
-
-storage = JsonStorage()
-
-# Очистка URL для безопасного логирования
-def sanitize_url(url):
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    sensitive_params = ['token', 'password', 'key']
-    for param in sensitive_params:
-        if param in query_params:
-            query_params[param] = ['[REDACTED]']
-    query = "&".join(f"{k}={v[0]}" for k, v in query_params.items()) if query_params else ""
-    return parsed._replace(query=query).geturl()
-
-# Проверка валидности URL
-async def is_valid_url(url):
-    sanitized_url = sanitize_url(url)
-    if not re.match(r'^https?://[^\s]+$', url):
-        logger.error(f"Недействительный URL: {sanitized_url}")
-        return False
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(url, timeout=5) as r:
-                if r.status in (200, 301, 302):
-                    return True
-                elif r.status == 429:
-                    logger.warning(f"Слишком много запросов для {sanitized_url}")
-                    return False
-                return False
-    except aiohttp.ClientError as e:
-        logger.error(f"Ошибка проверки URL {sanitized_url}: {e}")
-        return False
-    except asyncio.TimeoutError:
-        logger.error(f"Таймаут при проверке URL {sanitized_url}")
-        return False
-
-# Функция сокращения ссылки через VK API
-async def shorten_link_vk(url):
-    sanitized_url = sanitize_url(url)
-    if not await is_valid_url(url):
-        return None, "Недействительный или недоступный URL"
-    encoded_url = quote(url, safe='')
-    if len(encoded_url) > 8000:
-        logger.error(f"URL слишком длинный: {sanitized_url}")
-        return None, "URL слишком длинный для сокращения"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://api.vk.com/method/utils.getShortLink?url={encoded_url}&v=5.199&access_token={VK_TOKEN}") as resp:
-                data = await resp.json()
-                if 'response' in data and 'short_url' in data['response']:
-                    return data['response']['short_url'], ""
-                logger.error(f"Ошибка VK API для {sanitized_url}: {data.get('error', 'Неизвестная ошибка')}")
-                return None, "Ошибка VK API"
-    except Exception as e:
-        logger.error(f"Ошибка при сокращении ссылки {sanitized_url}: {e}")
-        return None, "Не удалось сократить ссылку"
-
-# Функция получения статистики по ссылке
-async def get_link_stats(key, date_from=None, date_to=None):
-    params = {"access_token": VK_TOKEN, "key": key, "v": "5.199", "interval": "day", "extended": 1}
-    if date_from and date_to:
-        params["date_from"] = date_from
-        params["date_to"] = date_to
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.vk.com/method/utils.getLinkStats", params=params) as resp:
-                data = await resp.json()
-                stats = {"views": 0, "countries": {}}
-                if 'response' in data and 'stats' in data['response']:
-                    for day in data['response']['stats']:
-                        stats["views"] += day.get("views", 0)
-                        country_id = day.get("country")
-                        if country_id:
-                            stats["countries"][country_id] = stats["countries"].get(country_id, 0) + day.get("views", 0)
-                return stats
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики для ключа {key}: {e}")
-        return {"views": 0, "countries": {}}
-
-# Получение названий стран
-async def get_country_name(country_id):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://api.vk.com/method/database.getCountriesById?country_ids={country_id}&v=5.199&access_token={VK_TOKEN}") as resp:
-                data = await resp.json()
-                if 'response' in data and data['response']:
-                    return data['response'][0].get('name', 'Неизвестная страна')
-                return 'Неизвестная страна'
-    except Exception as e:
-        logger.error(f"Ошибка получения названия страны {country_id}: {e}")
-        return 'Неизвестная страна'
-
-# Создание клавиатуры
-def make_kb(buttons, row=2):
-    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i+row] for i in range(0, len(buttons), row)])
-
-# Главное меню
-def get_main_menu():
-    return make_kb([
-        InlineKeyboardButton(text="🔗 Сократить ссылку", callback_data="add_link"),
-        InlineKeyboardButton(text="📊 Статистика переходов", callback_data="stats"),
-        InlineKeyboardButton(text="📋 Мои ссылки", callback_data="list_links"),
-    ])
-
-# Клавиатура отмены
-cancel_kb = make_kb([InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel")])
-
-# Декоратор обработки ошибок
-def handle_error(handler):
-    @wraps(handler)
-    async def wrapper(*args, **kwargs):
-        try:
-            sig = inspect.signature(handler)
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-            return await handler(*args, **filtered_kwargs)
-        except Exception as e:
-            logger.error(f"Ошибка в {handler.__name__}: {e}")
-            text = f"❌ Ошибка: {str(e)[:50]}"
-            reply = get_main_menu()
-            if isinstance(args[0], types.CallbackQuery):
-                await args[0].message.edit_text(text, reply_markup=reply)
-                await args[0].answer()
-            elif isinstance(args[0], types.Message):
-                await args[0].answer(text, reply_markup=reply)
-    return wrapper
-
-# Обработчики
-@router.message(Command("start"))
-@handle_error
-async def cmd_start(message: types.Message, state: FSMContext):
-    logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
-    await state.clear()
-    start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сократить ссылки\n📊 Смотреть статистику\n📋 Хранить ссылки"
-    logger.info(f"Отправляем стартовое сообщение: {start_message}")
-    await message.answer(start_message, reply_markup=get_main_menu())
-
-@router.message(Command("help"))
-@handle_error
-async def cmd_help(message: types.Message, state: FSMContext):
-    logger.info(f"Получена команда /help от пользователя {message.from_user.id}")
-    await state.clear()
-    await message.answer(
-        "ℹ️ Помощь по боту:\n\n"
-        "/start — начать работу\n"
-        "/help — показать эту справку\n"
-        "🔗 Используйте кнопки для сокращения ссылок, просмотра статистики и управления ссылками",
-        reply_markup=get_main_menu()
-    )
-
-@router.callback_query(lambda c: c.data == "cancel")
-@handle_error
-async def cancel_action(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("✅ Отменено", reply_markup=get_main_menu())
-    await cb.answer()
-
-@router.callback_query(lambda c: c.data == "add_link")
-@handle_error
-async def add_link(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text(
-        "🔗 Введите ссылку (http://... или https://...):",
-        reply_markup=cancel_kb
-    )
-    await state.set_state(LinkForm.waiting_for_link)
-    await cb.answer()
-
-@router.message(StateFilter(LinkForm.waiting_for_link))
-@handle_error
-async def process_link(message: types.Message, state: FSMContext):
-    url = message.text.strip()
-    if not await is_valid_url(url):
-        await message.answer("❌ Неверный или недоступный URL. Попробуйте снова (пример: https://example.com):", reply_markup=cancel_kb)
-        return
-    loading_msg = await message.answer('⏳ Сокращаю...')
-    short_url, error_msg = await shorten_link_vk(url)
-    await loading_msg.delete()
-    if not short_url:
-        await message.answer(f"❌ {error_msg}", reply_markup=cancel_kb)
-        return
-    await state.update_data(original=url, short=short_url)
-    await message.answer("📝 Введите название для ссылки (до 100 символов):", reply_markup=cancel_kb)
-    await state.set_state(LinkForm.waiting_for_title)
-
-@router.message(StateFilter(LinkForm.waiting_for_title))
-@handle_error
-async def process_title(message: types.Message, state: FSMContext):
-    title = message.text.strip()[:100]
-    if not title:
-        await message.answer("❌ Название не может быть пустым:", reply_markup=cancel_kb)
-        return
-    data = await state.get_data()
-    uid = str(message.from_user.id)
-    link_data = {
-        "title": title,
-        "short": data['short'],
-        "original": data['original'],
-        "created": datetime.now().isoformat()
-    }
-    storage.add_link(uid, link_data)
-    await message.answer(
-        f"✅ Ссылка сохранена:\n<b>{title}</b>\n{data['short']}",
-        parse_mode="HTML",
-        reply_markup=get_main_menu()
-    )
-    await state.clear()
-
-@router.callback_query(lambda c: c.data == "stats")
-@handle_error
-async def stats_menu(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text(
-        "📅 Введите даты (ГГГГ-ММ-ДД ГГГГ-ММ-ДД, например, 2025-06-01 2025-06-30):",
-        reply_markup=cancel_kb
-    )
-    await state.set_state(LinkForm.waiting_for_stats_date)
-    await cb.answer()
-
-@router.message(StateFilter(LinkForm.waiting_for_stats_date))
-@handle_error
-async def process_stats_date(message: types.Message, state: FSMContext):
-    dates = message.text.strip().split()
-    if len(dates) != 2 or not all(re.match(r"\d{4}-\d{2}-\d{2}", d) for d in dates):
-        await message.answer("❌ Неверный формат. Пример: 2025-06-01 2025-06-30", reply_markup=cancel_kb)
-        return
-    date_from, date_to = dates
-    try:
-        date_from_dt = datetime.strptime(date_from, "%Y-%m-%d")
-        date_to_dt = datetime.strptime(date_to, "%Y-%m-%d")
-        if date_from_dt > datetime.now():
-            await message.answer("❌ Начальная дата не может быть в будущем", reply_markup=cancel_kb)
-            return
-        if date_to_dt < date_from_dt:
-            await message.answer("❌ Конечная дата не может быть раньше начальной", reply_markup=cancel_kb)
-            return
-    except ValueError:
-        await message.answer("❌ Неверные даты. Используйте формат ГГГГ-ММ-ДД и реальные даты", reply_markup=cancel_kb)
-        return
-    uid = str(message.from_user.id)
-    links = storage.get_user_links(uid)
-    if not links:
-        await message.answer("📋 У вас нет ссылок", reply_markup=get_main_menu())
-        await state.clear()
-        return
-    await state.update_data(date_from=date_from, date_to=date_to)
-    buttons = [
-        InlineKeyboardButton(text=link['title'], callback_data=f"link_action:{i}")
-        for i, link in enumerate(links)
-    ]
-    buttons.append(InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel"))
-    kb = make_kb(buttons, row=1)
-    await message.answer("📊 Выберите ссылку для просмотра статистики или удаления:", reply_markup=kb)
-    await state.set_state(LinkForm.waiting_for_link_action)
-
-@router.callback_query(lambda c: c.data.startswith("link_action:"))
-@handle_error
-async def process_link_action(cb: types.CallbackQuery, state: FSMContext):
-    link_index = int(cb.data.split(":")[1])
-    uid = str(cb.from_user.id)
-    links = storage.get_user_links(uid)
-    if not (0 <= link_index < len(links)):
-        await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
-        await state.clear()
-        await cb.answer()
-        return
-    link = links[link_index]
-    buttons = [
-        InlineKeyboardButton(text="📈 Посмотреть статистику", callback_data=f"view_stats:{link_index}"),
-        InlineKeyboardButton(text="🗑 Удалить ссылку", callback_data=f"delete_link:{link_index}"),
-        InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel")
-    ]
-    kb = make_kb(buttons, row=1)
-    await cb.message.edit_text(f"🔗 {link['title']}:\n{link['short']}\nВыберите действие:", reply_markup=kb)
-    await cb.answer()
-
-@router.callback_query(lambda c: c.data.startswith("view_stats:"))
-@handle_error
-async def view_link_stats(cb: types.CallbackQuery, state: FSMContext):
-    link_index = int(cb.data.split(":")[1])
-    uid = str(cb.from_user.id)
-    links = storage.get_user_links(uid)
-    if not (0 <= link_index < len(links)):
-        await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
-        await state.clear()
-        await cb.answer()
-        return
-    link = links[link_index]
-    data = await state.get_data()
-    date_from = data.get("date_from")
-    date_to = data.get("date_to")
-    loading_msg = await cb.message.answer('⏳ Загружаем...')
-    stats = await get_link_stats(link['short'].split('/')[-1], date_from, date_to)
-    text = f"📊 Статистика для '{link['title']}'\nПериод: {date_from}—{date_to}\n\n"
-    text += f"👁 Переходы: {stats['views']}\n"
-    if stats['countries']:
-        text += "\n🌍 Геолокация:\n"
-        for country_id, views in stats['countries'].items():
-            country_name = await get_country_name(country_id)
-            text += f"{country_name}: {views} переходов\n"
-    await loading_msg.delete()
-    await cb.message.edit_text(text, reply_markup=get_main_menu())
-    await state.clear()
-    await cb.answer()
-
-@router.callback_query(lambda c: c.data.startswith("delete_link:"))
-@handle_error
-async def delete_link(cb: types.CallbackQuery, state: FSMContext):
-    link_index = int(cb.data.split(":")[1])
-    uid = str(cb.from_user.id)
-    if storage.delete_link(uid, link_index):
-        await cb.message.edit_text("✅ Ссылка удалена", reply_markup=get_main_menu())
-    else:
-        await cb.message.edit_text("❌ Ошибка удаления ссылки", reply_markup=get_main_menu())
-    await state.clear()
-    await cb.answer()
-
-@router.callback_query(lambda c: c.data == "list_links")
-@handle_error
-async def list_links(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    uid = str(cb.from_user.id)
-    links = storage.get_user_links(uid)
-    if not links:
-        await cb.message.edit_text("📋 У вас нет сохранённых ссылок", reply_markup=get_main_menu())
-        await cb.answer()
-        return
-    text = "📋 Ваши ссылки:\n\n"
-    for link in links:
-        link_text = f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
-        if len(text) + len(link_text) > 4000:
-            await cb.message.answer(text, reply_markup=get_main_menu())
-            text = "📋 Ваши ссылки (продолжение):\n\n"
-        text += link_text
-    await cb.message.edit_text(text, reply_markup=get_main_menu())
-    await cb.answer()
-
 async def main():
-    logger.info("Запуск бота...")
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
-            dp.include_router(router)
-            logger.info("Начинаем polling")
-            await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
-            break
-        except Exception as e:
-            logger.error(f"Ошибка бота (попытка {attempt + 1}/{max_attempts}): {e}")
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(5)
+    async with Bot(BOT_TOKEN) as bot:
+        dp = Dispatcher(storage=MemoryStorage())
+        router = Router()
+        dp.include_router(router)
+
+        # Класс состояний
+        class LinkForm(StatesGroup):
+            waiting_for_link = State()
+            waiting_for_title = State()
+            waiting_for_link_action = State()
+            waiting_for_rename = State()
+
+        # Класс для работы с JSON
+        class JsonStorage:
+            def __init__(self, file_name="links.json"):
+                self.file_name = file_name
+                self.data = self._load_data()
+
+            def _load_data(self):
+                try:
+                    with open(self.file_name, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    logger.info("Файл links.json не найден, создаётся новый")
+                    return {}
+
+            def _save_data(self):
+                with json_lock:
+                    try:
+                        with open(self.file_name, 'w', encoding='utf-8') as f:
+                            json.dump(self.data, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.error(f"Ошибка записи JSON: {e}")
+                        raise
+
+            def get_user_links(self, user_id):
+                return self.data.get(str(user_id), [])
+
+            def add_link(self, user_id, link_data):
+                uid = str(user_id)
+                with json_lock:
+                    self.data.setdefault(uid, [])
+                    if len(self.data[uid]) >= 50:
+                        self.data[uid].pop(0)
+                    self.data[uid].append(link_data)
+                    self._save_data()
+
+            def delete_link(self, user_id, link_index):
+                uid = str(user_id)
+                with json_lock:
+                    if uid in self.data and 0 <= link_index < len(self.data[uid]):
+                        self.data[uid].pop(link_index)
+                        self._save_data()
+                        return True
+                return False
+
+            def rename_link(self, user_id, link_index, new_title):
+                uid = str(user_id)
+                with json_lock:
+                    if uid in self.data and 0 <= link_index < len(self.data[uid]):
+                        self.data[uid][link_index]["title"] = new_title[:100]
+                        self._save_data()
+                        return True
+                return False
+
+        storage = JsonStorage()
+
+        # Очистка URL для безопасного логирования
+        def sanitize_url(url):
+            parsed = urlparse(url)
+            query_params = parse_qs(parsed.query)
+            sensitive_params = ['token', 'password', 'key']
+            for param in sensitive_params:
+                if param in query_params:
+                    query_params[param] = ['[REDACTED]']
+            query = "&".join(f"{k}={v[0]}" for k, v in query_params.items()) if query_params else ""
+            return parsed._replace(query=query).geturl()
+
+        # Проверка валидности URL
+        async def is_valid_url(url):
+            sanitized_url = sanitize_url(url)
+            if not re.match(r'^https?://[^\s]+$', url):
+                logger.error(f"Недействительный URL: {sanitized_url}")
+                return False
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url, timeout=5) as r:
+                        if r.status in (200, 301, 302):
+                            return True
+                        elif r.status == 429:
+                            logger.warning(f"Слишком много запросов для {sanitized_url}")
+                            return False
+                        return False
+            except aiohttp.ClientError as e:
+                logger.error(f"Ошибка проверки URL {sanitized_url}: {e}")
+                return False
+            except asyncio.TimeoutError:
+                logger.error(f"Таймаут при проверке URL {sanitized_url}")
+                return False
+
+        # Функция сокращения ссылки через VK API
+        async def shorten_link_vk(url):
+            sanitized_url = sanitize_url(url)
+            if not await is_valid_url(url):
+                return None, None, "Недействительный или недоступный URL"
+            encoded_url = quote(url, safe='')
+            if len(encoded_url) > 8000:
+                logger.error(f"URL слишком длинный: {sanitized_url}")
+                return None, None, "URL слишком длинный для сокращения"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"https://api.vk.com/method/utils.getShortLink?url={encoded_url}&v=5.199&access_token={VK_TOKEN}") as resp:
+                        data = await resp.json()
+                        if 'response' in data and 'short_url' in data['response']:
+                            return data['response']['short_url'], data['response']['key'], ""
+                        logger.error(f"Ошибка VK API для {sanitized_url}: {data.get('error', 'Неизвестная ошибка')}")
+                        return None, None, "Ошибка VK API"
+            except Exception as e:
+                logger.error(f"Ошибка при сокращении ссылки {sanitized_url}: {e}")
+                return None, None, "Не удалось сократить ссылку"
+
+        # Функция получения статистики по ссылке
+        async def get_link_stats(key):
+            params = {"access_token": VK_TOKEN, "key": key, "v": "5.199", "interval": "day", "extended": 1}
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://api.vk.com/method/utils.getLinkStats", params=params) as resp:
+                        data = await resp.json()
+                        stats = {"views": 0, "countries": {}}
+                        if 'response' in data and 'stats' in data['response']:
+                            for day in data['response']['stats']:
+                                stats["views"] += day.get("views", 0)
+                                country_id = day.get("country")
+                                if country_id:
+                                    stats["countries"][country_id] = stats["countries"].get(country_id, 0) + day.get("views", 0)
+                        return stats
+            except Exception as e:
+                logger.error(f"Ошибка получения статистики для ключа {key}: {e}")
+                return {"views": 0, "countries": {}}
+
+        # Получение названий стран
+        async def get_country_name(country_id):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"https://api.vk.com/method/database.getCountriesById?country_ids={country_id}&v=5.199&access_token={VK_TOKEN}") as resp:
+                        data = await resp.json()
+                        if 'response' in data and data['response']:
+                            return data['response'][0].get('name', 'Неизвестная страна')
+                        return 'Неизвестная страна'
+            except Exception as e:
+                logger.error(f"Ошибка получения названия страны {country_id}: {e}")
+                return 'Неизвестная страна'
+
+        # Создание клавиатуры
+        def make_kb(buttons, row=2):
+            return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i+row] for i in range(0, len(buttons), row)])
+
+        # Главное меню
+        def get_main_menu():
+            return make_kb([
+                InlineKeyboardButton(text="🔗 Сократить ссылку", callback_data="add_link"),
+                InlineKeyboardButton(text="📊 Статистика переходов", callback_data="stats"),
+            ])
+
+        # Клавиатура отмены
+        cancel_kb = make_kb([InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel")])
+
+        # Декоратор обработки ошибок
+        def handle_error(handler):
+            @wraps(handler)
+            async def wrapper(*args, **kwargs):
+                try:
+                    sig = inspect.signature(handler)
+                    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                    return await handler(*args, **filtered_kwargs)
+                except Exception as e:
+                    logger.error(f"Ошибка в {handler.__name__}: {str(type(e).__name__)} - {str(e)[:100]}")
+                    text = "❌ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь к администратору."
+                    reply = get_main_menu()
+                    if isinstance(args[0], types.CallbackQuery):
+                        await args[0].message.edit_text(text, reply_markup=reply)
+                        await args[0].answer()
+                    elif isinstance(args[0], types.Message):
+                        await args[0].answer(text, reply_markup=reply)
+            return wrapper
+
+        # Обработчики
+        @router.message(Command("start"))
+        @handle_error
+        async def cmd_start(message: types.Message, state: FSMContext):
+            logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
+            await state.clear()
+            start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сократить ссылки\n📊 Смотреть статистику"
+            logger.info(f"Отправляем стартовое сообщение: {start_message}")
+            await message.answer(start_message, reply_markup=get_main_menu())
+
+        @router.message(Command("help"))
+        @handle_error
+        async def cmd_help(message: types.Message, state: FSMContext):
+            logger.info(f"Получена команда /help от пользователя {message.from_user.id}")
+            await state.clear()
+            await message.answer(
+                "ℹ️ Помощь по боту:\n\n"
+                "/start — начать работу\n"
+                "/help — показать эту справку\n"
+                "🔗 Используйте кнопки для сокращения ссылок и просмотра статистики",
+                reply_markup=get_main_menu()
+            )
+
+        @router.callback_query(lambda c: c.data == "cancel")
+        @handle_error
+        async def cancel_action(cb: types.CallbackQuery, state: FSMContext):
+            await state.clear()
+            await cb.message.edit_text("✅ Отменено", reply_markup=get_main_menu())
+            await cb.answer()
+
+        @router.callback_query(lambda c: c.data == "add_link")
+        @handle_error
+        async def add_link(cb: types.CallbackQuery, state: FSMContext):
+            await state.clear()
+            await cb.message.edit_text(
+                "🔗 Введите ссылку (http://... или https://...):",
+                reply_markup=cancel_kb
+            )
+            await state.set_state(LinkForm.waiting_for_link)
+            await cb.answer()
+
+        @router.message(StateFilter(LinkForm.waiting_for_link))
+        @handle_error
+        async def process_link(message: types.Message, state: FSMContext):
+            url = message.text.strip()
+            if not await is_valid_url(url):
+                await message.answer("❌ Неверный или недоступный URL. Попробуйте снова (пример: https://example.com):", reply_markup=cancel_kb)
+                return
+            loading_msg = await message.answer('⏳ Сокращаю...')
+            short_url, key, error_msg = await shorten_link_vk(url)
+            await loading_msg.delete()
+            if not short_url:
+                await message.answer(f"❌ {error_msg}", reply_markup=cancel_kb)
+                return
+            await state.update_data(original=url, short=short_url, key=key)
+            await message.answer("📝 Введите название для ссылки (до 100 символов):", reply_markup=cancel_kb)
+            await state.set_state(LinkForm.waiting_for_title)
+
+        @router.message(StateFilter(LinkForm.waiting_for_title))
+        @handle_error
+        async def process_title(message: types.Message, state: FSMContext):
+            title = message.text.strip()[:100]
+            if not title:
+                await message.answer("❌ Название не может быть пустым:", reply_markup=cancel_kb)
+                return
+            data = await state.get_data()
+            uid = str(message.from_user.id)
+            link_data = {
+                "title": title,
+                "short": data['short'],
+                "original": data['original'],
+                "key": data['key'],  # Сохранение key для точной статистики
+                "created": datetime.now().isoformat()
+            }
+            storage.add_link(uid, link_data)
+            await message.answer(
+                f"✅ Ссылка сохранена:\n<b>{title}</b>\n{data['short']}",
+                parse_mode="HTML",
+                reply_markup=get_main_menu()
+            )
+            await state.clear()
+
+        @router.callback_query(lambda c: c.data == "stats")
+        @handle_error
+        async def stats_menu(cb: types.CallbackQuery, state: FSMContext):
+            await state.clear()
+            uid = str(cb.from_user.id)
+            links = storage.get_user_links(uid)
+            if not links:
+                await cb.message.edit_text("📋 У вас нет сохранённых ссылок", reply_markup=get_main_menu())
+                await cb.answer()
+                return
+            buttons = [
+                InlineKeyboardButton(text=link['title'], callback_data=f"link_action:{i}")
+                for i, link in enumerate(links)
+            ]
+            buttons.append(InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel"))
+            kb = make_kb(buttons, row=1)
+            await cb.message.edit_text("📊 Выберите ссылку для просмотра статистики:", reply_markup=kb)
+            await state.set_state(LinkForm.waiting_for_link_action)
+            await cb.answer()
+
+        @router.callback_query(lambda c: c.data.startswith("link_action:"))
+        @handle_error
+        async def process_link_action(cb: types.CallbackQuery, state: FSMContext):
+            link_index = int(cb.data.split(":")[1])
+            uid = str(cb.from_user.id)
+            links = storage.get_user_links(uid)
+            if not (0 <= link_index < len(links)):
+                await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
+                await state.clear()
+                await cb.answer()
+                return
+            link = links[link_index]
+            buttons = [
+                InlineKeyboardButton(text="⬅ Назад", callback_data="stats"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_link:{link_index}"),
+                InlineKeyboardButton(text="✏ Переименовать", callback_data=f"rename_link:{link_index}")
+            ]
+            kb = make_kb(buttons, row=1)
+            loading_msg = await cb.message.edit_text('⏳ Загружаем статистику...')
+            stats = await get_link_stats(link['key'])  # Используем сохранённый key
+            text = f"📊 Статистика для '{link['title']}'\n\n"
+            text += f"👁 Переходы: {stats['views']}\n"
+            if stats['countries']:
+                text += "\n🌍 Геолокация (по странам):\n"
+                for country_id, views in stats['countries'].items():
+                    country_name = await get_country_name(country_id)
+                    text += f"{country_name}: {views} переходов\n"
+            # Примечание: Города недоступны через VK API. Для городов нужен сторонний сервис (например, GeoPlugin) с IP-адресами переходов.
+            await loading_msg.delete()
+            await cb.message.edit_text(text, reply_markup=kb)
+            await cb.answer()
+
+        @router.callback_query(lambda c: c.data.startswith("delete_link:"))
+        @handle_error
+        async def delete_link(cb: types.CallbackQuery, state: FSMContext):
+            link_index = int(cb.data.split(":")[1])
+            uid = str(cb.from_user.id)
+            if storage.delete_link(uid, link_index):
+                await cb.message.edit_text("✅ Ссылка удалена", reply_markup=get_main_menu())
             else:
-                logger.error("Превышено количество попыток")
-                raise
-        finally:
-            logger.info("Закрытие сессии бота")
-            await bot.session.close()
+                await cb.message.edit_text("❌ Ошибка удаления ссылки", reply_markup=get_main_menu())
+            await state.clear()
+            await cb.answer()
+
+        @router.callback_query(lambda c: c.data.startswith("rename_link:"))
+        @handle_error
+        async def rename_link(cb: types.CallbackQuery, state: FSMContext):
+            link_index = int(cb.data.split(":")[1])
+            uid = str(cb.from_user.id)
+            links = storage.get_user_links(uid)
+            if not (0 <= link_index < len(links)):
+                await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
+                await state.clear()
+                await cb.answer()
+                return
+            await state.update_data(link_index=link_index)
+            await cb.message.edit_text("✏ Введите новое название для ссылки (до 100 символов):", reply_markup=cancel_kb)
+            await state.set_state(LinkForm.waiting_for_rename)
+            await cb.answer()
+
+        @router.message(StateFilter(LinkForm.waiting_for_rename))
+        @handle_error
+        async def process_rename(message: types.Message, state: FSMContext):
+            new_title = message.text.strip()[:100]
+            if not new_title:
+                await message.answer("❌ Название не может быть пустым:", reply_markup=cancel_kb)
+                return
+            data = await state.get_data()
+            link_index = data.get("link_index")
+            uid = str(message.from_user.id)
+            if storage.rename_link(uid, link_index, new_title):
+                links = storage.get_user_links(uid)
+                link = links[link_index]
+                await message.answer(
+                    f"✅ Ссылка переименована:\n<b>{new_title}</b>\n{link['short']}",
+                    parse_mode="HTML",
+                    reply_markup=get_main_menu()
+                )
+            else:
+                await message.answer("❌ Ошибка переименования ссылки", reply_markup=get_main_menu())
+            await state.clear()
+
+        # Запуск
+        logger.info("Запуск бота...")
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
+                logger.info("Начинаем polling")
+                await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
+                break
+            except Exception as e:
+                logger.error(f"Ошибка бота (попытка {attempt + 1}/{max_attempts}): {str(type(e).__name__)} - {str(e)[:100]}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(5)
+                else:
+                    logger.error("Превышено количество попыток")
+                    raise
 
 if __name__ == "__main__":
     import sys
