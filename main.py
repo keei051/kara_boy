@@ -37,10 +37,11 @@ class LinkForm(StatesGroup):
     waiting_for_link = State()
     waiting_for_title = State()
     waiting_for_stats_date = State()
+    waiting_for_link_action = State()
 
 # Класс для работы с JSON
 class JsonStorage:
-    def __init__(self, file_name=os.getenv("LINKS_PATH", "links.json")):
+    def __init__(self, file_name="links.json"):
         self.file_name = file_name
         self.data = self._load_data()
 
@@ -70,6 +71,14 @@ class JsonStorage:
             self.data[uid].pop(0)
         self.data[uid].append(link_data)
         self._save_data()
+
+    def delete_link(self, user_id, link_index):
+        uid = str(user_id)
+        if uid in self.data and 0 <= link_index < len(self.data[uid]):
+            self.data[uid].pop(link_index)
+            self._save_data()
+            return True
+        return False
 
 storage = JsonStorage()
 
@@ -137,14 +146,30 @@ async def get_link_stats(key, date_from=None, date_to=None):
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.vk.com/method/utils.getLinkStats", params=params) as resp:
                 data = await resp.json()
-                total = 0
+                stats = {"views": 0, "countries": {}}
                 if 'response' in data and 'stats' in data['response']:
                     for day in data['response']['stats']:
-                        total += day.get("views", 0)
-                return {"views": total}
+                        stats["views"] += day.get("views", 0)
+                        country_id = day.get("country")
+                        if country_id:
+                            stats["countries"][country_id] = stats["countries"].get(country_id, 0) + day.get("views", 0)
+                return stats
     except Exception as e:
         logger.error(f"Ошибка получения статистики для ключа {key}: {e}")
-        return {"views": 0}
+        return {"views": 0, "countries": {}}
+
+# Получение названий стран
+async def get_country_name(country_id):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.vk.com/method/database.getCountriesById?country_ids={country_id}&v=5.199&access_token={VK_TOKEN}") as resp:
+                data = await resp.json()
+                if 'response' in data and data['response']:
+                    return data['response'][0].get('name', 'Неизвестная страна')
+                return 'Неизвестная страна'
+    except Exception as e:
+        logger.error(f"Ошибка получения названия страны {country_id}: {e}")
+        return 'Неизвестная страна'
 
 # Создание клавиатуры
 def make_kb(buttons, row=2):
@@ -186,28 +211,9 @@ def handle_error(handler):
 async def cmd_start(message: types.Message, state: FSMContext):
     logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
     await state.clear()
-    start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сокращать ссылки\n📊 Смотреть статистику\n📋 Хранить ссылки"
+    start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сократить ссылки\n📊 Смотреть статистику\n📋 Хранить ссылки"
     logger.info(f"Отправляем стартовое сообщение: {start_message}")
     await message.answer(start_message, reply_markup=get_main_menu())
-
-@router.message(Command("links"))
-@handle_error
-async def cmd_links(message: types.Message, state: FSMContext):
-    logger.info(f"Получена команда /links от пользователя {message.from_user.id}")
-    await state.clear()
-    uid = str(message.from_user.id)
-    links = storage.get_user_links(uid)
-    if not links:
-        await message.answer("📋 У вас нет сохранённых ссылок", reply_markup=get_main_menu())
-        return
-    text = "📋 Ваши ссылки:\n\n"
-    for link in links:
-        link_text = f"🔗 {link['title']}:\n{link['short']}\nСоздано: {link['created'][:19]}\n\n"
-        if len(text) + len(link_text) > 4000:
-            await message.answer(text, reply_markup=get_main_menu())
-            text = "📋 Ваши ссылки (продолжение):\n\n"
-        text += link_text
-    await message.answer(text, reply_markup=get_main_menu())
 
 @router.message(Command("help"))
 @handle_error
@@ -217,7 +223,6 @@ async def cmd_help(message: types.Message, state: FSMContext):
     await message.answer(
         "ℹ️ Помощь по боту:\n\n"
         "/start — начать работу\n"
-        "/links — показать сохранённые ссылки\n"
         "/help — показать эту справку\n"
         "🔗 Используйте кнопки для сокращения ссылок, просмотра статистики и управления ссылками",
         reply_markup=get_main_menu()
@@ -318,24 +323,77 @@ async def process_stats_date(message: types.Message, state: FSMContext):
         await message.answer("📋 У вас нет ссылок", reply_markup=get_main_menu())
         await state.clear()
         return
-    loading_msg = await message.answer('⏳ Загружаем...')
-    semaphore = asyncio.Semaphore(5)
-    async def limited_get_stats(link, date_from, date_to, semaphore):
-        async with semaphore:
-            return await get_link_stats(link['short'].split('/')[-1], date_from, date_to)
-    stats = await asyncio.gather(
-        *(limited_get_stats(link, date_from, date_to, semaphore) for link in links)
-    )
-    text = f"📊 Статистика переходов за {date_from}—{date_to}\n\n"
-    total_views = 0
-    for i, link in enumerate(links):
-        views = stats[i]['views']
-        total_views += views
-        text += f"🔗 {link['title']}: {views} просмотров\n"
-    text += f"\n👁 Всего: {total_views} просмотров"
+    await state.update_data(date_from=date_from, date_to=date_to)
+    buttons = [
+        InlineKeyboardButton(text=link['title'], callback_data=f"link_action:{i}")
+        for i, link in enumerate(links)
+    ]
+    buttons.append(InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel"))
+    kb = make_kb(buttons, row=1)
+    await message.answer("📊 Выберите ссылку для просмотра статистики или удаления:", reply_markup=kb)
+    await state.set_state(LinkForm.waiting_for_link_action)
+
+@router.callback_query(lambda c: c.data.startswith("link_action:"))
+@handle_error
+async def process_link_action(cb: types.CallbackQuery, state: FSMContext):
+    link_index = int(cb.data.split(":")[1])
+    uid = str(cb.from_user.id)
+    links = storage.get_user_links(uid)
+    if not (0 <= link_index < len(links)):
+        await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
+        await state.clear()
+        await cb.answer()
+        return
+    link = links[link_index]
+    buttons = [
+        InlineKeyboardButton(text="📈 Посмотреть статистику", callback_data=f"view_stats:{link_index}"),
+        InlineKeyboardButton(text="🗑 Удалить ссылку", callback_data=f"delete_link:{link_index}"),
+        InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel")
+    ]
+    kb = make_kb(buttons, row=1)
+    await cb.message.edit_text(f"🔗 {link['title']}:\n{link['short']}\nВыберите действие:", reply_markup=kb)
+    await cb.answer()
+
+@router.callback_query(lambda c: c.data.startswith("view_stats:"))
+@handle_error
+async def view_link_stats(cb: types.CallbackQuery, state: FSMContext):
+    link_index = int(cb.data.split(":")[1])
+    uid = str(cb.from_user.id)
+    links = storage.get_user_links(uid)
+    if not (0 <= link_index < len(links)):
+        await cb.message.edit_text("❌ Ссылка не найдена", reply_markup=get_main_menu())
+        await state.clear()
+        await cb.answer()
+        return
+    link = links[link_index]
+    data = await state.get_data()
+    date_from = data.get("date_from")
+    date_to = data.get("date_to")
+    loading_msg = await cb.message.answer('⏳ Загружаем...')
+    stats = await get_link_stats(link['short'].split('/')[-1], date_from, date_to)
+    text = f"📊 Статистика для '{link['title']}'\nПериод: {date_from}—{date_to}\n\n"
+    text += f"👁 Переходы: {stats['views']}\n"
+    if stats['countries']:
+        text += "\n🌍 Геолокация:\n"
+        for country_id, views in stats['countries'].items():
+            country_name = await get_country_name(country_id)
+            text += f"{country_name}: {views} переходов\n"
     await loading_msg.delete()
-    await message.answer(text, reply_markup=get_main_menu())
+    await cb.message.edit_text(text, reply_markup=get_main_menu())
     await state.clear()
+    await cb.answer()
+
+@router.callback_query(lambda c: c.data.startswith("delete_link:"))
+@handle_error
+async def delete_link(cb: types.CallbackQuery, state: FSMContext):
+    link_index = int(cb.data.split(":")[1])
+    uid = str(cb.from_user.id)
+    if storage.delete_link(uid, link_index):
+        await cb.message.edit_text("✅ Ссылка удалена", reply_markup=get_main_menu())
+    else:
+        await cb.message.edit_text("❌ Ошибка удаления ссылки", reply_markup=get_main_menu())
+    await state.clear()
+    await cb.answer()
 
 @router.callback_query(lambda c: c.data == "list_links")
 @handle_error
