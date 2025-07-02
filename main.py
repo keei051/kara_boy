@@ -12,9 +12,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 import inspect
 from functools import wraps
 import threading
+from typing import Callable, Dict, Any, Awaitable
 
 # Настройка логгера
 logger.add("bot.log", rotation="1 MB", encoding="utf-8")
@@ -35,6 +37,22 @@ json_lock = threading.Lock()
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+
+# Middleware для передачи vk_session
+class VKSessionMiddleware(BaseMiddleware):
+    def __init__(self, vk_session: aiohttp.ClientSession):
+        super().__init__()
+        self.vk_session = vk_session
+
+    async def __call__(
+        self,
+        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: types.TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        logger.debug(f"Middleware: прокидываем vk_session для события {type(event).__name__}")
+        data["vk_session"] = self.vk_session
+        return await handler(event, data)
 
 # Класс состояний
 class LinkForm(StatesGroup):
@@ -473,9 +491,8 @@ async def main():
     logger.info("Запуск бота...")
     dp.include_router(router)  # Регистрация роутера до polling
     async with aiohttp.ClientSession() as vk_session:
-        # Передача vk_session через middleware
-        dp.message.middleware(lambda: {"vk_session": vk_session})
-        dp.callback_query.middleware(lambda: {"vk_session": vk_session})
+        # Регистрация middleware
+        dp.update.middleware(VKSessionMiddleware(vk_session))
         max_attempts = 5
         for attempt in range(max_attempts):
             try:
