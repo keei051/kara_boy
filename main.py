@@ -81,8 +81,13 @@ class JsonStorage:
             if len(self.data[uid]) >= 50:
                 removed_link = self.data[uid].pop(0)
                 logger.info(f"Удалена старая ссылка для {uid}: {removed_link['title']}")
+                # Уведомление пользователя
+                asyncio.create_task(
+                    bot.send_message(user_id, f"ℹ️ Старая ссылка '{removed_link['title']}' удалена из-за лимита в 50 ссылок.")
+                )
             self.data[uid].append(link_data)
             self._save_data()
+            logger.info(f"Добавлена ссылка для {uid}: {link_data['title']} ({link_data['original']})")
             return True
 
     def delete_link(self, user_id, link_index):
@@ -247,6 +252,7 @@ def handle_error(handler):
 @handle_error
 async def cmd_start(message: types.Message, state: FSMContext):
     logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
+    print("START!!!")  # Для отладки
     await state.clear()
     start_message = "✨ Добро пожаловать!\nВы можете:\n🔗 Сократить ссылки\n📊 Смотреть статистику"
     await message.answer(start_message, reply_markup=get_main_menu())
@@ -284,16 +290,16 @@ async def add_link(cb: types.CallbackQuery, state: FSMContext):
 
 @router.message(StateFilter(LinkForm.waiting_for_link))
 @handle_error
-async def process_link(message: types.Message, state: FSMContext, session: aiohttp.ClientSession):
+async def process_link(message: types.Message, state: FSMContext, vk_session: aiohttp.ClientSession):
     url = message.text.strip()
-    if not await is_valid_url(url, session):
+    if not await is_valid_url(url, vk_session):
         await message.answer(
             "❌ Неверный URL. Убедитесь, что он начинается с http:// или https:// и доступен.\nПример: https://example.com",
             reply_markup=cancel_kb
         )
         return
     loading_msg = await message.answer('⏳ Сокращаю...')
-    short_url, key, error_msg = await shorten_link_vk(url, session)
+    short_url, key, error_msg = await shorten_link_vk(url, vk_session)
     await loading_msg.delete()
     if not short_url:
         await message.answer(f"❌ {error_msg}", reply_markup=cancel_kb)
@@ -334,24 +340,52 @@ async def process_title(message: types.Message, state: FSMContext):
 async def stats_menu(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     uid = str(cb.from_user.id)
+    logger.info(f"Запрос статистики от user_id: {uid}")
     links = storage.get_user_links(uid)
+    logger.info(f"Ссылки пользователя {uid}: {[link['title'] for link in links]}")
     if not links:
+        logger.info(f"У пользователя {uid} нет сохранённых ссылок")
         await cb.message.edit_text("📋 У вас нет сохранённых ссылок", reply_markup=get_main_menu())
         await cb.answer()
         return
+    ITEMS_PER_PAGE = 10
     buttons = [
         InlineKeyboardButton(text=f"{link['title']} ({link['short']})", callback_data=f"link_stats:{i}")
-        for i, link in enumerate(links)
+        for i, link in enumerate(links[:ITEMS_PER_PAGE])
     ]
+    if len(links) > ITEMS_PER_PAGE:
+        buttons.append(InlineKeyboardButton(text="➡️ Далее", callback_data="stats_next:1"))
     buttons.append(InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel"))
     kb = make_kb(buttons, row=1)
     await cb.message.edit_text("📊 Выберите ссылку для просмотра статистики:", reply_markup=kb)
     await state.set_state(LinkForm.waiting_for_link_action)
     await cb.answer()
 
+@router.callback_query(lambda c: c.data.startswith("stats_next:"))
+@handle_error
+async def stats_next_page(cb: types.CallbackQuery, state: FSMContext):
+    page = int(cb.data.split(":")[1])
+    uid = str(cb.from_user.id)
+    links = storage.get_user_links(uid)
+    ITEMS_PER_PAGE = 10
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    buttons = [
+        InlineKeyboardButton(text=f"{link['title']} ({link['short']})", callback_data=f"link_stats:{i}")
+        for i, link in enumerate(links[start:end])
+    ]
+    if start > 0:
+        buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"stats_next:{page-1}"))
+    if end < len(links):
+        buttons.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"stats_next:{page+1}"))
+    buttons.append(InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel"))
+    kb = make_kb(buttons, row=1)
+    await cb.message.edit_text(f"📊 Выберите ссылку для просмотра статистики (страница {page+1}):", reply_markup=kb)
+    await cb.answer()
+
 @router.callback_query(lambda c: c.data.startswith("link_stats:"))
 @handle_error
-async def show_link_stats(cb: types.CallbackQuery, state: FSMContext, session: aiohttp.ClientSession):
+async def show_link_stats(cb: types.CallbackQuery, state: FSMContext, vk_session: aiohttp.ClientSession):
     link_index = int(cb.data.split(":")[1])
     uid = str(cb.from_user.id)
     links = storage.get_user_links(uid)
@@ -362,7 +396,7 @@ async def show_link_stats(cb: types.CallbackQuery, state: FSMContext, session: a
         return
     link = links[link_index]
     loading_msg = await cb.message.edit_text('⏳ Загружаем статистику...')
-    stats = await get_link_stats(link['key'], session)
+    stats = await get_link_stats(link['key'], vk_session)
     text = f"📊 Статистика для '{link['title']}'\n\n"
     text += f"🔗 Короткая ссылка: {link['short']}\n"
     text += f"🌐 Оригинальная ссылка: {link['original']}\n"
@@ -370,7 +404,7 @@ async def show_link_stats(cb: types.CallbackQuery, state: FSMContext, session: a
     if stats['countries']:
         text += "\n🌍 Геолокация (по странам):\n"
         for country_id, views in stats['countries'].items():
-            country_name = await get_country_name(country_id, session)
+            country_name = await get_country_name(country_id, vk_session)
             text += f"{country_name}: {views} переходов\n"
     else:
         text += "\n🌍 Геолокация: данные отсутствуют\n"
@@ -437,14 +471,16 @@ async def process_rename(message: types.Message, state: FSMContext):
 # Запуск
 async def main():
     logger.info("Запуск бота...")
-    async with aiohttp.ClientSession() as session:
-        bot.session = session  # Сохраняем сессию в объекте бота
+    dp.include_router(router)  # Регистрация роутера до polling
+    async with aiohttp.ClientSession() as vk_session:
+        # Передача vk_session через middleware
+        dp.message.middleware(lambda: {"vk_session": vk_session})
+        dp.callback_query.middleware(lambda: {"vk_session": vk_session})
         max_attempts = 5
         for attempt in range(max_attempts):
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
                 logger.info(f"Webhook успешно удалён с попытки {attempt + 1}")
-                dp.include_router(router)
                 logger.info("Начинаем polling")
                 await dp.start_polling(bot, polling_timeout=20, handle_as_tasks=False)
                 break
